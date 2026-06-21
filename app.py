@@ -42,13 +42,7 @@ DURATION_BUCKETS = [
 ]
 DURATION_BUCKET_BY_VALUE = {b["value"]: b for b in DURATION_BUCKETS}
 
-# Oblast boundaries for the map, from https://github.com/EugeneBorshch/ukraine_geojson
-# Its "name" property (e.g. "Харківська область") matches location_oblast exactly,
-# so no name-mapping table is needed -- downloaded once and cached to disk.
-UKRAINE_GEOJSON_URL = (
-    "https://raw.githubusercontent.com/EugeneBorshch/ukraine_geojson/master/UA_FULL_Ukraine.geojson"
-)
-UKRAINE_GEOJSON_CACHE = os.getenv("UKRAINE_GEOJSON_CACHE", "ukraine_oblasts.geojson")
+LOCAL_GEOJSON_PATH = "ukraine_geojson-master/UA_FULL_Ukraine.geojson"
 
 
 def ensure_db_exists() -> None:
@@ -132,6 +126,23 @@ def _duration_filter_clause(selected: list[str] | None) -> tuple[str, list]:
     return " AND (" + " OR ".join(clauses) + ")", params
 
 
+def load_ukraine_geojson() -> dict | None:
+    """
+    Load oblast boundaries for the map directly from a local GeoJSON file.
+    Returns None if the file is missing or unreadable.
+    """
+    if not os.path.exists(LOCAL_GEOJSON_PATH):
+        print(f"[ukraine-map] Error: Local GeoJSON file not found at '{LOCAL_GEOJSON_PATH}'. Please check the path.")
+        return None
+        
+    try:
+        with open(LOCAL_GEOJSON_PATH, encoding="utf-8") as f:
+            return json.load(f)
+    except Exception as exc:
+        print(f"[ukraine-map] Could not parse local oblast boundaries: {exc}")
+        return None
+
+
 def get_filtered_daily_counts(
     oblasts: list[str] | None,
     start_date: str | None,
@@ -139,7 +150,7 @@ def get_filtered_daily_counts(
     duration_values: list[str] | None,
 ) -> pd.DataFrame:
     """Alerts started per day, per oblast -- filtered by oblast, date range, and duration bucket."""
-    where = ["1=1"]
+    where = ["coalesce(location_oblast, location_title) NOT IN ('Луганська область', 'Донецька область')"]
     params: list = []
 
     if oblasts:
@@ -148,17 +159,17 @@ def get_filtered_daily_counts(
         params.extend(oblasts)
 
     if start_date:
-        where.append("CAST(started_at AS DATE) >= CAST(? AS DATE)")
+        where.append("CAST((started_at AT TIME ZONE 'UTC' AT TIME ZONE 'Europe/Kyiv') AS DATE) >= CAST(? AS DATE)")
         params.append(start_date)
     if end_date:
-        where.append("CAST(started_at AS DATE) <= CAST(? AS DATE)")
+        where.append("CAST((started_at AT TIME ZONE 'UTC' AT TIME ZONE 'Europe/Kyiv') AS DATE) <= CAST(? AS DATE)")
         params.append(end_date)
 
     duration_clause, duration_params = _duration_filter_clause(duration_values)
 
     sql = f"""
         SELECT
-            date_trunc('day', started_at) AS day,
+            date_trunc('day', started_at AT TIME ZONE 'UTC' AT TIME ZONE 'Europe/Kyiv') AS day,
             coalesce(location_oblast, location_title) AS oblast,
             count(*) AS alert_count
         FROM alerts
@@ -169,44 +180,27 @@ def get_filtered_daily_counts(
     return query_df(sql, params + duration_params)
 
 
-def load_ukraine_geojson() -> dict | None:
-    """
-    Load oblast boundaries for the map, caching to disk after the first download so the
-    app doesn't need network access on every restart. Returns None (rather than raising)
-    if the download fails, so a network hiccup degrades the map gracefully instead of
-    crashing the whole app.
-    """
-    if os.path.exists(UKRAINE_GEOJSON_CACHE):
-        try:
-            with open(UKRAINE_GEOJSON_CACHE, encoding="utf-8") as f:
-                return json.load(f)
-        except (json.JSONDecodeError, OSError):
-            pass  # cache file is corrupt/unreadable -- fall through and re-download
-
-    try:
-        resp = httpx.get(UKRAINE_GEOJSON_URL, timeout=15, follow_redirects=True)
-        resp.raise_for_status()
-        data = resp.json()
-        with open(UKRAINE_GEOJSON_CACHE, "w", encoding="utf-8") as f:
-            json.dump(data, f)
-        return data
-    except Exception as exc:
-        print(f"[ukraine-map] Could not load oblast boundaries: {exc}")
-        return None
-
-
 def get_available_months() -> list[str]:
     """Distinct 'YYYY-MM' months present in the data, oldest first -- drives the map's slider."""
-    df = query_df("SELECT DISTINCT strftime(started_at, '%Y-%m') AS ym FROM alerts ORDER BY 1")
+    df = query_df(
+        """
+        SELECT DISTINCT strftime(started_at AT TIME ZONE 'UTC' AT TIME ZONE 'Europe/Kyiv', '%Y-%m') AS ym 
+        FROM alerts 
+        WHERE coalesce(location_oblast, location_title) NOT IN ('Луганська область', 'Донецька область')
+        ORDER BY 1
+        """
+    )
     return df["ym"].tolist() if not df.empty else []
 
 
 def get_monthly_oblast_counts(year_month: str | None) -> pd.DataFrame:
     """Total alerts per oblast for the given 'YYYY-MM' month (all data if year_month is None)."""
     if year_month:
-        where, params = "strftime(started_at, '%Y-%m') = ?", [year_month]
+        where = "strftime(started_at AT TIME ZONE 'UTC' AT TIME ZONE 'Europe/Kyiv', '%Y-%m') = ? AND coalesce(location_oblast, location_title) NOT IN ('Луганська область', 'Донецька область')"
+        params = [year_month]
     else:
-        where, params = "1=1", []
+        where = "coalesce(location_oblast, location_title) NOT IN ('Луганська область', 'Донецька область')"
+        params = []
 
     sql = f"""
         SELECT
@@ -222,7 +216,12 @@ def get_monthly_oblast_counts(year_month: str | None) -> pd.DataFrame:
 def get_oblast_options() -> list[str]:
     """Distinct oblast names currently in the data, for the oblast filter dropdown."""
     df = query_df(
-        "SELECT DISTINCT coalesce(location_oblast, location_title) AS oblast FROM alerts ORDER BY 1"
+        """
+        SELECT DISTINCT coalesce(location_oblast, location_title) AS oblast 
+        FROM alerts 
+        WHERE coalesce(location_oblast, location_title) NOT IN ('Луганська область', 'Донецька область')
+        ORDER BY 1
+        """
     )
     return df["oblast"].tolist() if not df.empty else []
 
@@ -230,7 +229,13 @@ def get_oblast_options() -> list[str]:
 def get_date_bounds() -> tuple[str | None, str | None]:
     """Earliest/latest alert dates in the data, for the date-range picker's bounds."""
     df = query_df(
-        "SELECT min(CAST(started_at AS DATE)) AS min_d, max(CAST(started_at AS DATE)) AS max_d FROM alerts"
+        """
+        SELECT 
+            min(CAST((started_at AT TIME ZONE 'UTC' AT TIME ZONE 'Europe/Kyiv') AS DATE)) AS min_d, 
+            max(CAST((started_at AT TIME ZONE 'UTC' AT TIME ZONE 'Europe/Kyiv') AS DATE)) AS max_d 
+        FROM alerts
+        WHERE coalesce(location_oblast, location_title) NOT IN ('Луганська область', 'Донецька область')
+        """
     )
     if df.empty or pd.isna(df.loc[0, "min_d"]):
         return None, None
@@ -245,6 +250,7 @@ def get_oblast_totals() -> pd.DataFrame:
             coalesce(location_oblast, location_title) AS oblast,
             count(*) AS alert_count
         FROM alerts
+        WHERE coalesce(location_oblast, location_title) NOT IN ('Луганська область', 'Донецька область')
         GROUP BY 1
         ORDER BY 2 DESC
         """
@@ -254,8 +260,7 @@ def get_oblast_totals() -> pd.DataFrame:
 def get_oblast_total_hours() -> pd.DataFrame:
     """
     Total cumulative TIME spent under alert per oblast, in hours -- only counts completed
-    alerts (a still-active one has no duration yet). This is a different ranking than
-    get_oblast_totals(): an oblast can have fewer, longer alerts and still top this chart.
+    alerts (a still-active one has no duration yet).
     """
     return query_df(
         """
@@ -265,6 +270,7 @@ def get_oblast_total_hours() -> pd.DataFrame:
         FROM alerts
         WHERE finished_at IS NOT NULL
           AND finished_at > started_at
+          AND coalesce(location_oblast, location_title) NOT IN ('Луганська область', 'Донецька область')
         GROUP BY 1
         ORDER BY 2 DESC
         """
@@ -275,9 +281,16 @@ def get_active_alerts() -> pd.DataFrame:
     """Alerts currently in progress (finished_at is still null)."""
     return query_df(
         """
-        SELECT location_title, location_oblast, location_raion, location_type, alert_type, started_at
+        SELECT 
+            location_title, 
+            location_oblast, 
+            location_raion, 
+            location_type, 
+            alert_type, 
+            (started_at AT TIME ZONE 'UTC' AT TIME ZONE 'Europe/Kyiv') AS started_at
         FROM alerts
         WHERE finished_at IS NULL
+          AND coalesce(location_oblast, location_title) NOT IN ('Луганська область', 'Донецька область')
         ORDER BY started_at DESC
         """
     )
@@ -288,9 +301,10 @@ def get_national_daily_counts() -> pd.DataFrame:
     return query_df(
         """
         SELECT
-            date_trunc('day', started_at) AS day,
+            date_trunc('day', started_at AT TIME ZONE 'UTC' AT TIME ZONE 'Europe/Kyiv') AS day,
             count(*) AS alert_count
         FROM alerts
+        WHERE coalesce(location_oblast, location_title) NOT IN ('Луганська область', 'Донецька область')
         GROUP BY 1
         ORDER BY 1
         """
@@ -310,6 +324,7 @@ def get_alert_durations() -> pd.DataFrame:
         FROM alerts
         WHERE finished_at IS NOT NULL
           AND finished_at > started_at
+          AND coalesce(location_oblast, location_title) NOT IN ('Луганська область', 'Донецька область')
         """
     )
 
@@ -339,7 +354,16 @@ app.layout = dbc.Container(
             dbc.Col(
                 [
                     html.H5("Alerts by Oblast — Monthly Map", className="mb-2"),
-                    dcc.Graph(id="ukraine-map", style={"height": "520px"}),
+                    dcc.Loading(
+                        id="loading-ukraine-map",
+                        type="circle",
+                        color="orange",
+                        children=dcc.Graph(
+                            id="ukraine-map",
+                            style={"height": "520px"},  # Add the height back here
+                            config={"displayModeBar": False}
+                        )
+                    ),
                     html.Div(
                         dcc.Slider(
                             id="month-slider",
@@ -347,10 +371,17 @@ app.layout = dbc.Container(
                             max=max(len(AVAILABLE_MONTHS) - 1, 0),
                             step=1,
                             value=max(len(AVAILABLE_MONTHS) - 1, 0),
-                            marks={i: m for i, m in enumerate(AVAILABLE_MONTHS)},
+                            marks={
+                                i: {
+                                    "label": m,
+                                    "style": {"transform": "rotate(-45deg)", "marginTop": "15px", "whiteSpace": "nowrap"},
+                                    "color": "white"
+                                } 
+                                for i, m in enumerate(AVAILABLE_MONTHS)
+                            },
                         ),
-                        className="px-4 pt-2 pb-1",
-                    ),
+                        className="px-4 pt-2 pb-5",
+                    )
                 ],
                 width=12,
             ),
@@ -374,8 +405,22 @@ app.layout = dbc.Container(
         ),
         dbc.Row(
             [
-                dbc.Col(dcc.Graph(id="total-count-chart"), width=6),
-                dbc.Col(dcc.Graph(id="total-duration-chart"), width=6),
+                dbc.Col(
+                    dcc.Loading(
+                        id="loading-total-count",
+                        type="circle",
+                        children=dcc.Graph(id="total-count-chart")
+                    ), 
+                    width=6
+                ),
+                dbc.Col(
+                    dcc.Loading(
+                        id="loading-total-duration",
+                        type="circle",
+                        children=dcc.Graph(id="total-duration-chart")
+                    ), 
+                    width=6
+                ),
             ],
             className="mb-4",
         ),
@@ -389,6 +434,7 @@ app.layout = dbc.Container(
                             options=[{"label": o, "value": o} for o in OBLAST_OPTIONS],
                             multi=True,
                             placeholder="All oblasts",
+                            style={"color": "black"}
                         ),
                     ],
                     width=4,
@@ -402,6 +448,7 @@ app.layout = dbc.Container(
                             max_date_allowed=MAX_DATE,
                             start_date=MIN_DATE,
                             end_date=MAX_DATE,
+                            style={"color": "black"}
                         ),
                     ],
                     width=4,
@@ -414,6 +461,7 @@ app.layout = dbc.Container(
                             options=[{"label": b["label"], "value": b["value"]} for b in DURATION_BUCKETS],
                             multi=True,
                             placeholder="All durations",
+                            style={"color": "black"}
                         ),
                     ],
                     width=4,
@@ -423,19 +471,47 @@ app.layout = dbc.Container(
         ),
         dbc.Row(
             [
-                dbc.Col(dcc.Graph(id="daily-trend-chart"), width=8),
-                dbc.Col(dcc.Graph(id="oblast-totals-chart"), width=4),
+                dbc.Col(
+                    dcc.Loading(
+                        id="loading-daily-trend",
+                        type="circle",
+                        children=dcc.Graph(id="daily-trend-chart")
+                    ), 
+                    width=8
+                ),
+                dbc.Col(
+                    dcc.Loading(
+                        id="loading-oblast-totals",
+                        type="circle",
+                        children=dcc.Graph(id="oblast-totals-chart")
+                    ), 
+                    width=4
+                ),
             ]
         ),
         dbc.Row(
             [
-                dbc.Col(dcc.Graph(id="escalation-trend-chart"), width=8),
+                dbc.Col(
+                    dcc.Loading(
+                        id="loading-escalation-trend",
+                        type="circle",
+                        children=dcc.Graph(id="escalation-trend-chart")
+                    ), 
+                    width=8
+                ),
                 dbc.Col(html.Div(id="trend-badge"), width=4, className="d-flex align-items-center justify-content-center"),
             ],
             className="mt-3",
         ),
         dbc.Row(
-            dbc.Col(dcc.Graph(id="duration-histogram"), width=12),
+            dbc.Col(
+                dcc.Loading(
+                    id="loading-duration-histogram",
+                    type="circle",
+                    children=dcc.Graph(id="duration-histogram")
+                ), 
+                width=12
+            ),
             className="mt-3",
         ),
     ],
@@ -471,8 +547,27 @@ def update_ukraine_map(month_index: int):
         labels={"alert_count": "Alerts"},
         title=f"Alerts by Oblast — {year_month}",
     )
-    fig.update_geos(fitbounds="locations", visible=False)
-    fig.update_layout(template="plotly_dark", margin=dict(l=0, r=0, t=40, b=0))
+    occupied_df = pd.DataFrame({
+        "oblast": ["Луганська область", "Донецька область", "Автономна Республіка Крим", "м. Севастополь"],
+        "status": ["Occupied", "Occupied", "Occupied", "Occupied"]
+    })
+    occupied_fig = px.choropleth(
+        occupied_df,
+        geojson=UKRAINE_GEOJSON,
+        locations="oblast",
+        featureidkey="properties.name",
+        color="status",
+        color_discrete_map={"Occupied": "orange"}
+    )
+    occupied_fig.update_traces(showlegend=False)
+    
+    fig.add_trace(occupied_fig.data[0])
+
+    fig.update_geos(fitbounds="locations", visible=False, showland=True, landcolor="#444444")
+    fig.update_layout(
+        template="plotly_dark", 
+        margin=dict(l=0, r=0, t=40, b=0)
+    )
     return fig
 
 

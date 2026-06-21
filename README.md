@@ -4,11 +4,10 @@ A dashboard that visualizes air-raid alert activity across Ukraine's oblasts ove
 monthly choropleth map, live "currently active" tracking, total alert counts and cumulative
 time-under-alert by oblast, escalation/de-escalation trends, and alert duration distributions.
 
-Built for a hackathon. Data comes from three places:
+Built for a hackathon. Data comes from two places:
 
 - **Live data** — polled from the [alerts.in.ua](https://alerts.in.ua) API
-- **Historical data** — loaded from the Kaggle [Air-raid sirens in Ukraine](https://www.kaggle.com/datasets/cashncarry/airraid-sirens-in-ukraine) dataset
-- **Synthetic data** — generated locally, for development/demo without needing either of the above
+- **Historical data sample** — loaded from the Kaggle [Air-raid sirens in Ukraine](https://www.kaggle.com/datasets/cashncarry/airraid-sirens-in-ukraine) dataset (this is what the submitted demo uses, since we didn't receive API access in time)
 
 ## Features
 
@@ -34,9 +33,8 @@ Built for a hackathon. Data comes from three places:
 ├── app.py                     # Dash dashboard (run this to view the app)
 ├── src/
 │   ├── ingest.py               # Live ingestion: polls the alerts.in.ua API into DuckDB
-│   └── generate_fake_data.py   # Loads synthetic or Kaggle historical data into DuckDB
+│   └── retrieve_data_sample.py # Loads the real historical data sample into DuckDB
 ├── data/
-│   ├── oblasts_only.csv         # Kaggle dataset, oblast-level (place here manually)
 │   └── full_data.csv            # Kaggle dataset, oblast+raion+hromada-level (place here manually)
 ├── pyproject.toml             # uv-managed dependencies
 ├── uv.lock
@@ -67,7 +65,7 @@ Built for a hackathon. Data comes from three places:
 ## Running
 
 You need data in the database before the dashboard shows anything interesting. Pick one or
-more of the options below — they're all safe to combine, since each source is tagged and
+both of the options below — they're safe to combine, since each source is tagged and
 stored in its own id range (see [Data sources](#data-sources--id-ranges) below).
 
 ### Option A — Live + recent history (real, requires an API token)
@@ -80,27 +78,17 @@ uv run python src/ingest.py backfill
 uv run python src/ingest.py live
 ```
 
-### Option B — Historical data from the Kaggle dataset (real, no API token needed)
+### Option B — Historical data sample (real, no API token needed)
 
-Download `oblasts_only.csv` and/or `full_data.csv` from
+This is the data source used for the submitted demo. Download `full_data.csv` from
 [the Kaggle dataset page](https://www.kaggle.com/datasets/cashncarry/airraid-sirens-in-ukraine)
 into the `data/` folder, then:
 
 ```bash
-uv run python src/generate_fake_data.py kaggle --csv data/oblasts_only.csv
-# and/or, for hromada-level detail:
-uv run python src/generate_fake_data.py kaggle --csv data/full_data.csv
+uv run python src/retrieve_data_sample.py
 ```
 
-See [Kaggle dataset structure](#kaggle-dataset-structure) below for what each CSV looks like.
-
-### Option C — Synthetic data (fake, no files or tokens needed)
-
-Useful for quickly testing the dashboard's layout/charts without any real data:
-
-```bash
-uv run python src/generate_fake_data.py random --days 30 --avg-per-day 15
-```
+See [Kaggle dataset structure](#kaggle-dataset-structure) below for what the CSV looks like.
 
 ### Launch the dashboard
 
@@ -112,19 +100,8 @@ Open **http://localhost:8050**.
 
 ## Kaggle dataset structure
 
-The loader (`src/generate_fake_data.py kaggle`) auto-detects which of the two CSV shapes
-you point it at:
-
-### `oblasts_only.csv` — oblast-level only
-
-| Column | Meaning |
-|---|---|
-| `region` | Oblast name (English, e.g. `"Vinnytska oblast"`, or `"Kyiv City"`) |
-| `started_at` | Alert start timestamp (UTC) |
-| `finished_at` | Alert end timestamp (UTC), if known |
-| `naive` | `True` if no end-of-alert message was ever received — `finished_at` is the source's own estimate (start + 30 min), not a confirmed end time |
-
-### `full_data.csv` — oblast + raion + hromada granularity
+The loader (`src/retrieve_data_sample.py`) expects `full_data.csv` (oblast + raion +
+hromada granularity):
 
 | Column | Meaning |
 |---|---|
@@ -132,7 +109,8 @@ you point it at:
 | `raion` | District name, populated for finer-than-oblast rows |
 | `hromada` | Community (hromada) name, populated when `level == "hromada"` |
 | `level` | Granularity of this specific row: `"oblast"`, `"hromada"`, etc. |
-| `started_at` / `finished_at` | Same as above |
+| `started_at` | Alert start timestamp (UTC) |
+| `finished_at` | Alert end timestamp (UTC), if known |
 
 ### How this maps into the database
 
@@ -140,11 +118,18 @@ you point it at:
   transliteration (`"Kharkivska oblast"`), while the live API and the dashboard's map use
   Ukrainian (`"Харківська область"`). Every row is canonicalized to the Ukrainian name
   on load, since that's what the choropleth map joins against.
-- `naive=True` rows keep their estimated `finished_at` (nulling it out would make 2022/2023
-  historical rows look "currently active" in the dashboard) but are flagged via the
-  `calculated` field — the same field/meaning the real API uses for estimated end times.
 - `hromada`/`raion` values flow into `location_raion` / `location_title`, which is what
   lets the Currently Active panel show finer-than-oblast detail when that data is loaded.
+
+### Known limitation
+
+A handful of hromada names in this export are not unique across oblasts (e.g.
+"Kostiantynivska terytorialna hromada" appears under four different oblasts with identical
+timestamps). This looks like a name-collision artifact in the source data rather than four
+simultaneous real alerts, and it will slightly inflate per-oblast totals for the affected
+oblasts. Dedupe on `(started_at, finished_at, location_title)` before relying on exact
+oblast-level counts, or before building any filter that assumes hromada names are unique
+to one oblast.
 
 ## Data sources & id ranges
 
@@ -153,11 +138,9 @@ Each data source is tagged so it can be identified and cleared independently:
 | Source | `notes` value | id range |
 |---|---|---|
 | Live API (`ingest.py`) | *(none)* | real alerts.in.ua ids |
-| Kaggle historical (`generate_fake_data.py kaggle`) | `KAGGLE_HISTORICAL_DATA` | `800,000,000`–`899,999,999` |
-| Synthetic (`generate_fake_data.py random`) | `SYNTHETIC TEST DATA` | `900,000,000`–`999,999,999` |
+| Historical data sample (`retrieve_data_sample.py`) | `KAGGLE_HISTORICAL_DATA` | `800,000,000`–`899,999,999` |
 
-Pass `--clear` to either `generate_fake_data.py` subcommand to wipe just that source's rows
-before reloading.
+Pass `--clear` to `retrieve_data_sample.py` to wipe its rows before reloading.
 
 ## Attribution
 
